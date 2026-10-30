@@ -2,3 +2,4 @@
 # wheels separately (see README). The public boto3 lacks queryTexts/returnScores.
 flask>=3.0
 requests>=2.31
+openpyxl>=3.1

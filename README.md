@@ -207,6 +207,11 @@ How it is measured:
   throttling at higher concurrency is expected.
 - Only one load test runs at a time; starting a second returns HTTP 409.
 
+When a test finishes or is stopped, **Export to Excel** downloads an `.xlsx`
+report with four sheets: *Summary* (settings and the results table),
+*Latency details* (count, avg, min, p50 to p99 and max for each phase, plus
+OpenSearch `took`), *Errors* (error codes and counts) and *Queries*.
+
 The same test is available over HTTP:
 
 ```bash
@@ -215,6 +220,7 @@ curl -s -XPOST http://127.0.0.1:8077/api/bench/start -H 'Content-Type: applicati
 # -> {"id": "<run-id>"}
 curl -s http://127.0.0.1:8077/api/bench/<run-id>          # progress and results
 curl -s -XPOST http://127.0.0.1:8077/api/bench/<run-id>/stop
+curl -s -o report.xlsx http://127.0.0.1:8077/api/bench/<run-id>/export.xlsx   # after it finishes
 ```
 
 Run the load test from a host close to both backends. The OpenSearch domain
@@ -267,6 +273,7 @@ by rank, and min_max weighting, which depends on the slider.
 ```
 app.py                       Flask backend: embedding, both searches, API
 bench.py                     Load test engine (threads, percentiles)
+export_xlsx.py               Excel report for a load test run
 templates/index.html         Search comparison page
 templates/bench.html         Load test page
 opensearch/*.json            Search pipeline definitions

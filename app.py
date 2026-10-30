@@ -27,10 +27,11 @@ import boto3
 import requests
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from requests.auth import HTTPBasicAuth
 
 import bench
+import export_xlsx
 
 # ---------------------------------------------------------------------------
 # Configuration: read from environment variables (see .env.example).
@@ -510,6 +511,24 @@ def bench_stop(run_id):
         return jsonify({"error": "unknown run"}), 404
     run.stop()
     return jsonify({"ok": True})
+
+
+@app.route("/api/bench/<run_id>/export.xlsx")
+def bench_export(run_id):
+    run = _bench_current
+    if not run or run.id != run_id:
+        return jsonify({"error": "unknown run"}), 404
+    status = run.status()
+    if status["state"] == "running":
+        return jsonify({"error": "the load test is still running"}), 409
+    data = export_xlsx.build_workbook(status, [text for text, _ in run.queries])
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(status.get("finished") or time.time()))
+    filename = f"loadtest-{stamp}-c{status['settings']['concurrency']}-{run.id}.xlsx"
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
