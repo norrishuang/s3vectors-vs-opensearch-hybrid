@@ -1,0 +1,4 @@
+# boto3/botocore must be the S3 Vectors Hybrid Search beta build; install those
+# wheels separately (see README). The public boto3 lacks queryTexts/returnScores.
+flask>=3.0
+requests>=2.31

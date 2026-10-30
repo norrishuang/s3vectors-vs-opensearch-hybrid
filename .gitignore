@@ -1,0 +1,16 @@
+# Local configuration and secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# S3 Vectors beta SDK (confidential, distributed by AWS to beta participants only)
+sdk/
+*.whl
+*.zip
+
+# Runtime files
+server.log
+app.pid

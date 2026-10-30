@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hybrid Search: S3 Vectors vs OpenSearch</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a22; --panel2: #1e222c; --border: #2a2f3a;
+    --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f9cff; --accent2: #ffb454;
+    --os: #4f9cff; --s3v: #ff8a4f; --good: #4ade80; --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { margin: 0 0 4px; font-size: 18px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .searchbar { display: flex; gap: 10px; padding: 18px 24px; align-items: center;
+    position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--border); z-index: 10; }
+  .searchbar input[type=text] { flex: 1; padding: 11px 14px; font-size: 15px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); }
+  .searchbar input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .searchbar input[type=number] { width: 72px; padding: 11px 10px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 8px; color: var(--text); }
+  .searchbar select { padding: 11px 10px; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
+  .searchbar button { padding: 11px 22px; font-size: 15px; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: #06101f; border: none; border-radius: 8px; }
+  .searchbar button:disabled { opacity: .5; cursor: default; }
+  .searchbar label { color: var(--muted); font-size: 12px; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; padding: 18px 24px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  .col { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .col .head { padding: 14px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; }
+  .col .head .name { font-weight: 700; font-size: 15px; }
+  .col.os .head { border-top: 3px solid var(--os); }
+  .col.s3v .head { border-top: 3px solid var(--s3v); }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 11px; padding: 3px 9px; border-radius: 999px;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
+  .badge.lat { color: var(--text); font-weight: 600; }
+  .badge.lat b { color: var(--accent2); }
+  .badge.ok { color: var(--good); border-color: #2d5a3d; }
+  .badge.err { color: var(--bad); border-color: #5a2d2d; }
+  .meta { padding: 8px 16px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--border); }
+  .results { padding: 6px 0; max-height: calc(100vh - 320px); overflow-y: auto; }
+  .hit { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .hit:last-child { border-bottom: none; }
+  .hit .rank { color: var(--muted); font-size: 11px; }
+  .hit .title { font-weight: 600; margin: 2px 0; }
+  .hit .title a { color: var(--accent); text-decoration: none; }
+  .hit .snippet { color: var(--muted); font-size: 12.5px; }
+  .hit .scores { margin-top: 4px; font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+  .hit .scores span { margin-right: 12px; }
+  .err-box { padding: 16px; color: var(--bad); font-size: 12.5px; font-family: ui-monospace, monospace;
+    white-space: pre-wrap; word-break: break-word; }
+  .empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .summary { padding: 0 24px 8px; color: var(--muted); font-size: 12px; }
+  .summary b { color: var(--text); }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hybrid Search Comparison · S3 Vectors vs OpenSearch</h1>
+  <div class="sub">Your text is embedded once via the OpenSearch ML connector (Bedrock cohere.embed-multilingual-v3, input_type=search_query),
+    then the same vector drives both hybrid queries. OpenSearch latency = server <code>took</code>;
+    S3 Vectors latency = client round-trip (no server timing field).</div>
+</header>
+
+<div class="searchbar">
+  <input type="text" id="q" placeholder="Type a search query, e.g. &quot;what causes the aurora borealis&quot;" autofocus>
+  <label>topK</label>
+  <input type="number" id="k" value="10" min="1" max="100">
+  <label>OpenSearch fusion</label>
+  <select id="pipeline">
+    {% for name, p in pipelines.items() %}
+    <option value="{{ name }}" {% if name == default_pipeline %}selected{% endif %}>{{ p.label }}</option>
+    {% endfor %}
+  </select>
+  <button id="go">Search</button>
+</div>
+
+<div class="summary" id="summary"></div>
+
+<div class="cols">
+  <div class="col os">
+    <div class="head">
+      <span class="name">🔵 OpenSearch</span>
+      <div class="badges" id="os-badges"></div>
+    </div>
+    <div class="meta" id="os-meta"></div>
+    <div class="results" id="os-results"><div class="empty">Run a search to see results.</div></div>
+  </div>
+  <div class="col s3v">
+    <div class="head">
+      <span class="name">🟠 S3 Vectors</span>
+      <div class="badges" id="s3v-badges"></div>
+    </div>
+    <div class="meta" id="s3v-meta"></div>
+    <div class="results" id="s3v-results"><div class="empty">Run a search to see results.</div></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function renderSide(prefix, data){
+  const badges = $(`#${prefix}-badges`);
+  const meta = $(`#${prefix}-meta`);
+  const results = $(`#${prefix}-results`);
+  if(!data || data.ok === false){
+    badges.innerHTML = `<span class="badge err">error</span>`;
+    meta.textContent = '';
+    results.innerHTML = `<div class="err-box">${esc(data && data.error || 'no response')}${data && data.trace ? '\n\n'+esc(data.trace) : ''}</div>`;
+    return;
+  }
+  const latVal = (data.took_ms != null) ? data.took_ms : data.wall_ms;
+  const latLabel = (data.took_ms != null) ? 'took' : 'round-trip';
+  badges.innerHTML =
+    `<span class="badge lat"><b>${latVal}</b> ms <span style="color:var(--muted)">(${latLabel})</span></span>` +
+    `<span class="badge ok">${data.count} hits</span>`;
+  const extra = (data.took_ms != null && data.wall_ms != null)
+    ? ` · wall ${data.wall_ms} ms` : '';
+  meta.innerHTML = `${esc(data.mode)} · latency: ${esc(data.latency_source)}${extra}` +
+    (data.note ? `<br><span style="color:var(--bad)">${esc(data.note)}</span>` : '');
+  if(!data.results || !data.results.length){
+    results.innerHTML = `<div class="empty">No results.</div>`;
+    return;
+  }
+  results.innerHTML = data.results.map((h,i) => {
+    const title = h.url
+      ? `<a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.title||h.id||'(untitled)')}</a>`
+      : esc(h.title||h.id||'(untitled)');
+    let scores = '';
+    if(h.score != null) scores += `<span>score: ${(+h.score).toFixed(5)}</span>`;
+    if(h.bm25 != null) scores += `<span>bm25: ${(+h.bm25).toFixed(3)}</span>`;
+    if(h.distance != null) scores += `<span>dist: ${(+h.distance).toFixed(5)}</span>`;
+    if(h.id) scores += `<span>id: ${esc(String(h.id))}</span>`;
+    return `<div class="hit">
+      <div class="rank">#${i+1}</div>
+      <div class="title">${title}</div>
+      <div class="snippet">${esc(h.text||'')}</div>
+      <div class="scores">${scores}</div>
+    </div>`;
+  }).join('');
+}
+
+async function doSearch(){
+  const q = $('#q').value.trim();
+  if(!q) return;
+  const k = parseInt($('#k').value,10) || 10;
+  $('#go').disabled = true;
+  $('#summary').innerHTML = `<span class="spinner"></span> Embedding query &amp; searching both sources…`;
+  ['os','s3v'].forEach(p => {
+    $(`#${p}-badges`).innerHTML = `<span class="badge"><span class="spinner"></span></span>`;
+    $(`#${p}-results`).innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+    $(`#${p}-meta`).textContent = '';
+  });
+  try {
+    const t0 = performance.now();
+    const r = await fetch('/api/search', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({q, k, pipeline: $('#pipeline').value})
+    });
+    const data = await r.json();
+    const total = (performance.now()-t0).toFixed(0);
+    if(data.error){
+      $('#summary').innerHTML = `<span style="color:var(--bad)">${esc(data.error)}</span>`;
+      renderSide('os', {ok:false, error:data.error});
+      renderSide('s3v', {ok:false, error:data.error});
+      return;
+    }
+    renderSide('os', data.opensearch);
+    renderSide('s3v', data.s3vectors);
+    const osL = data.opensearch && (data.opensearch.took_ms ?? data.opensearch.wall_ms);
+    const s3L = data.s3vectors && (data.s3vectors.wall_ms);
+    let cmp = '';
+    if(typeof osL === 'number' && typeof s3L === 'number'){
+      const faster = osL < s3L ? 'OpenSearch' : 'S3 Vectors';
+      cmp = ` · <b>${faster}</b> faster this query`;
+    }
+    $('#summary').innerHTML =
+      `Query: <b>"${esc(q)}"</b> · embed <b>${data.embed_ms} ms</b> · ` +
+      `OpenSearch <b>${osL ?? '—'} ms</b> · S3 Vectors <b>${s3L ?? '—'} ms</b> · ` +
+      `end-to-end ${total} ms${cmp}`;
+  } catch(e){
+    $('#summary').innerHTML = `<span style="color:var(--bad)">Request failed: ${esc(String(e))}</span>`;
+  } finally {
+    $('#go').disabled = false;
+  }
+}
+
+$('#go').addEventListener('click', doSearch);
+$('#q').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
+$('#pipeline').addEventListener('change', () => { if($('#q').value.trim()) doSearch(); });
+</script>
+</body>
+</html>

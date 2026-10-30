@@ -1,0 +1,158 @@
+# s3vectors-vs-opensearch-hybrid
+
+A small web UI for comparing **hybrid search** (full-text + vector) on
+**Amazon S3 Vectors** and **Amazon OpenSearch Service**, side by side, on the
+same dataset.
+
+Type a query once. The app embeds it once, sends the same query text and the
+same query vector to both backends, and shows the two ranked result lists with
+their latency next to each other.
+
+## How it works
+
+```
+                       ┌──────────────────────────────┐
+  query text ──► Flask │ 1. embed via OpenSearch ML   │──► Bedrock Cohere
+                       │    model (_predict)          │
+                       │ 2. same text + same vector   │
+                       └───────┬──────────────┬───────┘
+                               │              │
+              OpenSearch hybrid query    S3 Vectors QueryVectors
+              (BM25 + k-NN, fused by a   (queryVector + queryTexts,
+               search pipeline)           fused server-side with RRF)
+```
+
+1. **Embedding.** The query text is embedded once through an OpenSearch ML
+   Commons model backed by a Bedrock Cohere connector. The app passes
+   `input_type=search_query` on each `_predict` call, overriding the
+   connector's default.
+2. **OpenSearch.** A `hybrid` query combines `multi_match` (BM25 on `title`
+   and `text`) with a `knn` query on `embedding`. The results are fused by a
+   search pipeline that you pick in the UI:
+   - `rrf-hybrid-pipeline`: Reciprocal Rank Fusion, `rank_constant` 60.
+   - `nlp-search-pipeline`: min_max normalization and a weighted arithmetic
+     mean (BM25 0.3, k-NN 0.7).
+3. **S3 Vectors.** A single `QueryVectors` call with both `queryVector` and
+   `queryTexts`. The service runs vector search and BM25 search and fuses them
+   with RRF. Each hit has `scores.fused`, `scores.bm25Scores` and
+   `scores.vectorDistance`, and the UI shows all three.
+
+### Latency
+
+| Backend | What is shown |
+|---|---|
+| OpenSearch | Server-side `took` from the search response |
+| S3 Vectors | Client-side round-trip time of the `QueryVectors` call. The API returns no server-side timing, so this number includes network time. |
+
+The embedding time is shown separately and is not included in either number.
+
+## Requirements
+
+- Python 3.9+
+- An OpenSearch Service domain (2.19+ for the RRF `score-ranker-processor`;
+  developed against 3.7) with the neural-search and ML Commons plugins, an
+  index with a `knn_vector` field, and a deployed Bedrock Cohere embedding model.
+- An S3 Vectors vector index with a searchable text field
+  (`textSearchConfigurations`) in `us-east-2`.
+- The **S3 Vectors Hybrid Search beta SDK** (boto3/botocore wheels). The public
+  boto3 has no `queryTexts` or `returnScores` on `QueryVectors`. The beta SDK is
+  available to enrolled beta participants through their AWS account team and is
+  not included in this repository.
+- AWS credentials with `s3vectors:QueryVectors` and `s3vectors:GetIndex` on
+  the vector index.
+
+The query embedding model must be the same model that produced the stored
+document vectors. The demo dataset (Cohere Wikipedia embeddings) was embedded
+with `cohere.embed-multilingual-v3`. Querying it with
+`cohere.embed-english-v3` gives near-random vector results.
+
+## Setup
+
+```bash
+git clone https://github.com/norrishuang/s3vectors-vs-opensearch-hybrid.git
+cd s3vectors-vs-opensearch-hybrid
+
+python3 -m venv .venv
+. .venv/bin/activate
+pip install /path/to/hybrid-pythonsdk/botocore-*.whl /path/to/hybrid-pythonsdk/boto3-*.whl
+pip install -r requirements.txt
+
+cp .env.example .env    # then fill in your endpoints, password and IDs
+```
+
+Create the OpenSearch search pipelines (the definitions are in `opensearch/`):
+
+```bash
+curl -u "admin:$OPENSEARCH_PASSWORD" -XPUT "$OPENSEARCH_ENDPOINT/_search/pipeline/rrf-hybrid-pipeline" \
+  -H 'Content-Type: application/json' -d @opensearch/rrf-hybrid-pipeline.json
+curl -u "admin:$OPENSEARCH_PASSWORD" -XPUT "$OPENSEARCH_ENDPOINT/_search/pipeline/nlp-search-pipeline" \
+  -H 'Content-Type: application/json' -d @opensearch/nlp-search-pipeline.json
+```
+
+## Configuration
+
+All settings come from environment variables, which `run.sh` and `restart.sh`
+load from `.env`. See `.env.example`.
+
+| Variable | Description |
+|---|---|
+| `OPENSEARCH_ENDPOINT` | HTTPS endpoint of the domain |
+| `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD` | Basic-auth user (fine-grained access control) |
+| `OPENSEARCH_INDEX` | Index with `title`, `text` and an `embedding` knn_vector field |
+| `OPENSEARCH_SEARCH_PIPELINE` | Default fusion pipeline (`rrf-hybrid-pipeline` or `nlp-search-pipeline`) |
+| `ML_MODEL_ID` | Deployed ML Commons model used to embed the query |
+| `EMBED_INPUT_TYPE` | Cohere `input_type` for the query, default `search_query` |
+| `S3V_REGION` | S3 Vectors region, default `us-east-2` |
+| `S3V_BUCKET` / `S3V_INDEX` | Vector bucket and index |
+| `S3V_TEXT_KEY` | Searchable metadata key, default `passage_body` |
+
+Non-secret settings can also be passed as command-line flags; run
+`python app.py --help`. The password is read from the environment only.
+
+## Run
+
+```bash
+./run.sh 8077          # foreground
+./restart.sh 8077      # background, writes app.pid and server.log
+```
+
+Open <http://127.0.0.1:8077>. The server binds to `127.0.0.1` only. To reach
+it from your laptop, use an SSH tunnel:
+
+```bash
+ssh -L 8077:127.0.0.1:8077 ec2-user@<host>
+```
+
+### API
+
+```bash
+curl -s -XPOST http://127.0.0.1:8077/api/search -H 'Content-Type: application/json' \
+  -d '{"q": "who invented the telephone", "k": 10, "pipeline": "rrf-hybrid-pipeline"}'
+
+curl -s http://127.0.0.1:8077/api/health
+```
+
+## Comparing fairly
+
+- Use `rrf-hybrid-pipeline` on OpenSearch so both sides use the same fusion
+  method. With `rank_constant` 60, the top S3 Vectors fused score is 1/60
+  (0.0167), which suggests it uses the same constant.
+- The full-text halves search different fields. OpenSearch matches on `title`
+  and `text`; S3 Vectors searches only `passage_body`, which holds the text
+  without the title. This affects BM25 ranking.
+- The demo OpenSearch index stores vectors with `mode: on_disk` and 32x
+  compression, so the first queries can be slow while data is read from disk.
+
+## Project layout
+
+```
+app.py                       Flask backend: embedding, both searches, API
+templates/index.html         Single-page UI
+opensearch/*.json            Search pipeline definitions
+run.sh / restart.sh          Start scripts (load .env)
+.env.example                 Configuration template
+```
+
+## License
+
+[MIT](LICENSE)

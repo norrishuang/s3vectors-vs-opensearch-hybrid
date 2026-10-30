@@ -1,0 +1,13 @@
+{
+  "description": "RRF for hybrid search comparison with S3 Vectors",
+  "phase_results_processors": [
+    {
+      "score-ranker-processor": {
+        "combination": {
+          "technique": "rrf",
+          "rank_constant": 60
+        }
+      }
+    }
+  ]
+}
