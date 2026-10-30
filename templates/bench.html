@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Load test: S3 Vectors vs OpenSearch</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a22; --panel2: #1e222c; --border: #2a2f3a;
+    --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f9cff; --accent2: #ffb454;
+    --os: #4f9cff; --s3v: #ff8a4f; --good: #4ade80; --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+    display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  header h1 { margin: 0 0 4px; font-size: 18px; }
+  header .sub { color: var(--muted); font-size: 12px; max-width: 900px; }
+  nav a { color: var(--accent); text-decoration: none; font-size: 13px; margin-left: 14px; }
+  nav a.on { color: var(--text); font-weight: 600; }
+  main { padding: 18px 24px; display: grid; grid-template-columns: 380px 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  input[type=number], select, textarea { width: 100%; padding: 8px 10px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 8px; color: var(--text); font: inherit; }
+  textarea { min-height: 220px; font-family: ui-monospace, monospace; font-size: 12px; resize: vertical; }
+  .weights { display: flex; align-items: center; gap: 8px; }
+  .weights[hidden] { display: none; }
+  .weights input { flex: 1; accent-color: var(--accent); }
+  #wlabel { font-family: ui-monospace, monospace; font-size: 12px; }
+  .check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  .buttons { display: flex; gap: 10px; margin-top: 6px; }
+  button { padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer; border-radius: 8px; border: none; }
+  #start { background: var(--accent); color: #06101f; }
+  #stop { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  button:disabled { opacity: .45; cursor: default; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .status { padding: 12px 14px; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 14px; font-size: 13px; }
+  .status b { color: var(--text); }
+  .status.err { color: var(--bad); border-color: #5a2d2d; }
+  .bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .5s linear; }
+  @media (prefers-reduced-motion: reduce) { .bar > div { transition: none; } }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  th:first-child, td:first-child { text-align: left; }
+  td.os { border-left: 3px solid var(--os); }
+  td.s3v { border-left: 3px solid var(--s3v); }
+  td.best { color: var(--good); font-weight: 700; }
+  .group th { color: var(--text); text-align: center; border-bottom: 1px solid var(--border); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .errs { color: var(--bad); font-size: 12px; margin-top: 8px; font-family: ui-monospace, monospace; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Load test · S3 Vectors vs OpenSearch</h1>
+    <div class="sub">Query-only load test. Queries are embedded once before the test. Each backend is tested in turn,
+      OpenSearch first, then S3 Vectors: a warmup pass, a single-thread serial pass, then N Python threads for the set
+      duration. Latency is client-side wall-clock time per search call, measured the same way for both backends.</div>
+  </div>
+  <nav><a href="/">Search</a><a href="/bench" class="on">Load test</a></nav>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Settings</h2>
+    <div class="row">
+      <div class="field">
+        <label for="concurrency">Concurrency (threads)</label>
+        <input type="number" id="concurrency" value="4" min="{{ limits.concurrency[0] }}" max="{{ limits.concurrency[1] }}">
+      </div>
+      <div class="field">
+        <label for="duration">Duration per backend (s)</label>
+        <input type="number" id="duration" value="60" min="{{ limits.duration_s[0] }}" max="{{ limits.duration_s[1] }}">
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="rounds">Serial rounds</label>
+        <input type="number" id="rounds" value="3" min="{{ limits.serial_rounds[0] }}" max="{{ limits.serial_rounds[1] }}">
+      </div>
+      <div class="field">
+        <label for="k">topK</label>
+        <input type="number" id="k" value="10" min="1" max="100">
+      </div>
+    </div>
+    <div class="field">
+      <label for="pipeline">OpenSearch fusion</label>
+      <select id="pipeline">
+        {% for name, p in pipelines.items() %}
+        <option value="{{ name }}" {% if name == default_pipeline %}selected{% endif %}>{{ p.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field weights" id="weights" hidden>
+      <span>BM25</span>
+      <input type="range" id="bm25w" min="0" max="1" step="0.05" value="0.5">
+      <span id="wlabel">0.50 / 0.50</span>
+      <span>kNN</span>
+    </div>
+    <div class="field">
+      <label for="queries">Queries (one per line, used round-robin)</label>
+      <textarea id="queries">{{ sample_queries | join('\n') }}</textarea>
+    </div>
+    <label class="check"><input type="checkbox" id="warmup" checked> Warmup pass before measuring (not counted)</label>
+    <div class="buttons">
+      <button id="start">Start</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <div class="hint" id="estimate"></div>
+  </section>
+
+  <section class="card">
+    <h2>Results</h2>
+    <div class="status" id="status">Not started.</div>
+    <div id="results"><div class="empty">Run a load test to see results.</div></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = v => (v === null || v === undefined) ? '—' : v;
+let runId = null, timer = null, cfg = null;
+
+function syncWeights(){ $('#weights').hidden = $('#pipeline').value !== 'nlp-search-pipeline'; }
+function updateWeightLabel(){ const b = +$('#bm25w').value; $('#wlabel').textContent = `${b.toFixed(2)} / ${(1-b).toFixed(2)}`; }
+function queries(){ return $('#queries').value.split('\n').map(s => s.trim()).filter(Boolean); }
+function estimate(){
+  const d = +$('#duration').value || 0;
+  $('#estimate').textContent = `Concurrent phases take about ${2*d} s in total (${d} s per backend), plus the warmup and serial passes.`;
+}
+
+function payload(){
+  const p = {
+    concurrency: +$('#concurrency').value, duration_s: +$('#duration').value,
+    serial_rounds: +$('#rounds').value, k: +$('#k').value,
+    pipeline: $('#pipeline').value, warmup: $('#warmup').checked, queries: queries(),
+  };
+  if(p.pipeline === 'nlp-search-pipeline') p.bm25_weight = +$('#bm25w').value;
+  return p;
+}
+
+function setRunning(on){
+  $('#start').disabled = on; $('#stop').disabled = !on;
+  document.querySelectorAll('section.card input, section.card select, section.card textarea')
+    .forEach(el => el.disabled = on);
+}
+
+async function start(){
+  const body = payload();
+  $('#status').className = 'status';
+  $('#status').innerHTML = `Embedding ${body.queries.length} queries…`;
+  setRunning(true);
+  try {
+    const r = await fetch('/api/bench/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(!r.ok){ throw new Error(d.error || r.statusText); }
+    runId = d.id; cfg = body;
+    poll();
+    timer = setInterval(poll, 1000);
+  } catch(e){
+    $('#status').className = 'status err';
+    $('#status').textContent = `Could not start: ${e.message}`;
+    setRunning(false);
+  }
+}
+
+async function stop(){ if(runId) await fetch(`/api/bench/${runId}/stop`, {method:'POST'}); }
+
+async function poll(){
+  if(!runId) return;
+  let d;
+  try { d = await (await fetch(`/api/bench/${runId}`)).json(); } catch(e){ return; }
+  if(!d.state){
+    clearInterval(timer); timer = null; setRunning(false);
+    $('#status').className = 'status err';
+    $('#status').textContent = `Lost the run: ${d.error || 'unknown error'} (the server may have restarted).`;
+    return;
+  }
+  renderStatus(d);
+  renderResults(d);
+  if(d.state !== 'running'){ clearInterval(timer); timer = null; setRunning(false); }
+}
+
+function renderStatus(d){
+  const el = $('#status');
+  el.className = 'status' + (d.state === 'failed' ? ' err' : '');
+  if(d.state === 'running' && d.live){
+    const conc = d.live.phase.includes('concurrent');
+    const pct = conc ? Math.min(100, 100 * d.live.elapsed_s / d.settings.duration_s) : 0;
+    el.innerHTML = `Running: <b>${esc(d.live.phase)}</b> · ${d.live.elapsed_s} s · ${d.live.requests} requests · ` +
+      `${d.live.qps} req/s` + (conc ? `<div class="bar"><div style="width:${pct}%"></div></div>` : '');
+  } else if(d.state === 'running'){
+    el.innerHTML = 'Starting…';
+  } else if(d.state === 'failed'){
+    el.textContent = `Failed: ${d.error}`;
+  } else {
+    const s = d.settings;
+    el.innerHTML = `<b>${d.state === 'stopped' ? 'Stopped' : 'Finished'}</b> · concurrency ${s.concurrency} · ` +
+      `${s.duration_s} s per backend · ${s.queries} queries · topK ${s.k} · OpenSearch fusion: ${esc(s.pipeline)}` +
+      (s.bm25_weight !== null && s.bm25_weight !== undefined ? ` (BM25 ${s.bm25_weight} / kNN ${(1 - s.bm25_weight).toFixed(2)})` : '');
+  }
+}
+
+function bestOf(rows, get, higher){
+  const vals = rows.map(get).filter(v => typeof v === 'number');
+  if(vals.length < 2) return null;
+  return higher ? Math.max(...vals) : Math.min(...vals);
+}
+
+function renderResults(d){
+  const keys = ['opensearch', 's3vectors'];
+  const rows = keys.map(k => ({key: k, cls: k === 'opensearch' ? 'os' : 's3v', ...d.results[k]}))
+    .filter(r => r.serial || r.concurrent);
+  if(!rows.length){ return; }
+  const cols = [
+    ['Serial avg', r => r.serial?.latency_ms?.avg, false],
+    ['QPS', r => r.concurrent?.qps, true],
+    ['p50', r => r.concurrent?.latency_ms?.p50, false],
+    ['p90', r => r.concurrent?.latency_ms?.p90, false],
+    ['p95', r => r.concurrent?.latency_ms?.p95, false],
+    ['p99', r => r.concurrent?.latency_ms?.p99, false],
+  ];
+  const best = cols.map(([, get, higher]) => bestOf(rows, get, higher));
+  let html = `<table>
+    <tr class="group"><th></th><th>Serial (1 thread)</th><th colspan="5">Concurrent (${d.settings.concurrency} threads)</th><th colspan="3"></th></tr>
+    <tr><th>Backend</th><th>avg latency (ms)</th><th>QPS</th><th>p50 (ms)</th><th>p90 (ms)</th><th>p95 (ms)</th><th>p99 (ms)</th>
+      <th>OK</th><th>Failed</th><th>Throttled</th></tr>`;
+  for(const r of rows){
+    const c = r.concurrent || {};
+    html += `<tr><td class="${r.cls}">${esc(r.label)}</td>`;
+    cols.forEach(([, get], i) => {
+      const v = get(r);
+      html += `<td class="${v === best[i] && v !== undefined ? 'best' : ''}">${fmt(v)}</td>`;
+    });
+    html += `<td>${fmt(c.requests_ok)}</td><td>${fmt(c.requests_failed)}</td><td>${fmt(c.throttled)}</td></tr>`;
+  }
+  html += `</table>`;
+
+  // Details: serial distribution, server took, error breakdown.
+  let notes = '';
+  for(const r of rows){
+    const s = r.serial?.latency_ms, c = r.concurrent;
+    const parts = [];
+    if(s && s.count) parts.push(`serial: ${s.count} requests, p50 ${s.p50} ms, min ${s.min} ms, max ${s.max} ms`);
+    if(c) parts.push(`concurrent: ${c.elapsed_s} s, max ${fmt(c.latency_ms?.max)} ms, error rate ${c.error_rate_pct}%`);
+    if(c?.server_took_ms?.count) parts.push(`server took p50 ${c.server_took_ms.p50} ms / p99 ${c.server_took_ms.p99} ms`);
+    notes += `<div class="note"><b>${esc(r.label)}</b>: ${parts.join(' · ')}</div>`;
+    const errs = {};
+    for(const src of [r.serial?.errors, c?.errors]) for(const [k, v] of Object.entries(src || {})) errs[k] = (errs[k] || 0) + v;
+    if(Object.keys(errs).length){
+      notes += `<div class="errs">${esc(r.label)} errors: ${Object.entries(errs).map(([k,v]) => `${esc(k)} × ${v}`).join(', ')}</div>`;
+    }
+  }
+  notes += `<div class="note">Green marks the better value in each column. QPS counts successful requests only.
+    S3 Vectors calls are made without SDK retries, so throttled requests are counted as failures instead of adding hidden latency.</div>`;
+  $('#results').innerHTML = html + notes;
+}
+
+$('#start').addEventListener('click', start);
+$('#stop').addEventListener('click', stop);
+$('#pipeline').addEventListener('change', syncWeights);
+$('#bm25w').addEventListener('input', updateWeightLabel);
+$('#duration').addEventListener('input', estimate);
+syncWeights(); updateWeightLabel(); estimate();
+</script>
+</body>
+</html>

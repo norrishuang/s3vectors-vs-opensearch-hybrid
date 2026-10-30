@@ -171,6 +171,57 @@ Step-by-step instructions, including IAM permissions, job parameters and
 troubleshooting, are in
 [docs/ingestion-emr-serverless.md](docs/ingestion-emr-serverless.md).
 
+## Load test
+
+Open <http://127.0.0.1:8077/bench> (the **Load test** link in the header) to
+measure query throughput and latency. Only search queries are sent; nothing is
+written to either backend.
+
+Settings: concurrency (1–64 Python threads), duration per backend (5–600 s),
+serial rounds, topK, OpenSearch fusion (with the BM25/k-NN slider for min_max),
+and the query list, which defaults to the 10 sample queries below and is used
+round-robin.
+
+The backends are tested one after the other, OpenSearch first, then S3
+Vectors. For each backend:
+
+1. **Warmup**: every query once, not measured (optional).
+2. **Serial**: one thread runs every query *serial rounds* times. Reported as
+   the average latency.
+3. **Concurrent**: N threads send queries back to back for the set duration.
+   Reported as QPS (successful requests per second), p50/p90/p95/p99 latency,
+   and counts of successful, failed and throttled requests.
+
+How it is measured:
+
+- Each query is embedded once before the test starts, so embedding time is
+  not part of any number.
+- Latency is client-side wall-clock time per search call, including the
+  network round trip, measured the same way for both backends. OpenSearch's
+  server-side `took` is also shown, for reference.
+- Each OpenSearch thread uses its own HTTP keep-alive session. S3 Vectors
+  threads share one boto3 client sized for the thread count.
+- S3 Vectors calls are made without SDK retries, so throttling
+  (`TooManyRequestsException`) is reported as failed requests instead of
+  appearing as extra latency. The beta has a per-index request-rate limit, so
+  throttling at higher concurrency is expected.
+- Only one load test runs at a time; starting a second returns HTTP 409.
+
+The same test is available over HTTP:
+
+```bash
+curl -s -XPOST http://127.0.0.1:8077/api/bench/start -H 'Content-Type: application/json' \
+  -d '{"concurrency": 8, "duration_s": 60, "serial_rounds": 3, "k": 10, "pipeline": "rrf-hybrid-pipeline"}'
+# -> {"id": "<run-id>"}
+curl -s http://127.0.0.1:8077/api/bench/<run-id>          # progress and results
+curl -s -XPOST http://127.0.0.1:8077/api/bench/<run-id>/stop
+```
+
+Run the load test from a host close to both backends. The OpenSearch domain
+and the S3 Vectors index in the demo are in different regions, so network
+distance affects the numbers; the gap between client latency and OpenSearch
+`took` shows how much.
+
 ## Sample queries
 
 The demo dataset is English Wikipedia. These queries are grouped by which half
@@ -215,7 +266,9 @@ by rank, and min_max weighting, which depends on the slider.
 
 ```
 app.py                       Flask backend: embedding, both searches, API
-templates/index.html         Single-page UI
+bench.py                     Load test engine (threads, percentiles)
+templates/index.html         Search comparison page
+templates/bench.html         Load test page
 opensearch/*.json            Search pipeline definitions
 run.sh / restart.sh          Start scripts (load .env)
 .env.example                 Configuration template

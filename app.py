@@ -19,14 +19,18 @@ public SDK has no queryTexts/returnScores on QueryVectors.
 import argparse
 import os
 import sys
+import threading
 import time
 import traceback
 
 import boto3
 import requests
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, render_template, request
 from requests.auth import HTTPBasicAuth
+
+import bench
 
 # ---------------------------------------------------------------------------
 # Configuration: read from environment variables (see .env.example).
@@ -110,13 +114,8 @@ def embed(text):
 # ---------------------------------------------------------------------------
 # OpenSearch hybrid search (BM25 on text + knn on embedding, RRF-fused)
 # ---------------------------------------------------------------------------
-def search_opensearch(query_text, vector, k, pipeline=None, bm25_weight=None):
-    """
-    Hybrid query combining BM25 full-text and kNN vector search, fused by the
-    given search pipeline (RRF or min_max weighted). Falls back to a bool
-    should (BM25 + knn) if the hybrid query is rejected.
-    OpenSearch returns `took` in ms (server-side).
-    """
+def build_os_search(query_text, vector, k, pipeline=None, bm25_weight=None):
+    """Return (url, body, params, mode_label) for the OpenSearch hybrid query."""
     pipeline = pipeline or _cfg.get("os_search_pipeline")
     url = f"{_cfg['os_endpoint']}/{_cfg['os_index']}/_search"
     body = {
@@ -152,6 +151,18 @@ def search_opensearch(query_text, vector, k, pipeline=None, bm25_weight=None):
         if pipeline:
             params["search_pipeline"] = pipeline
         mode_label = PIPELINES.get(pipeline, {}).get("label", pipeline or "no pipeline")
+    return url, body, params, mode_label
+
+
+def search_opensearch(query_text, vector, k, pipeline=None, bm25_weight=None):
+    """
+    Hybrid query combining BM25 full-text and kNN vector search, fused by the
+    given search pipeline (RRF or min_max weighted). Falls back to a bool
+    should (BM25 + knn) if the hybrid query is rejected.
+    OpenSearch returns `took` in ms (server-side).
+    """
+    pipeline = pipeline or _cfg.get("os_search_pipeline")
+    url, body, params, mode_label = build_os_search(query_text, vector, k, pipeline, bm25_weight)
 
     t0 = time.perf_counter()
     resp = requests.post(
@@ -263,13 +274,9 @@ def s3v_client():
     return _s3v_client
 
 
-def search_s3vectors(query_text, vector, k):
-    """
-    Hybrid QueryVectors: query vector + queryTexts (BM25), fused server-side via RRF.
-    QueryVectors returns NO server-side timing, so latency is client-side wall-clock.
-    """
-    client = s3v_client()
-    kwargs = {
+def build_s3v_query(query_text, vector, k):
+    """Keyword arguments for a hybrid QueryVectors call."""
+    return {
         "vectorBucketName": _cfg["s3v_bucket"],
         "indexName": _cfg["s3v_index"],
         "topK": k,
@@ -279,6 +286,15 @@ def search_s3vectors(query_text, vector, k):
         "returnDistance": True,
         "returnScores": True,
     }
+
+
+def search_s3vectors(query_text, vector, k):
+    """
+    Hybrid QueryVectors: query vector + queryTexts (BM25), fused server-side via RRF.
+    QueryVectors returns NO server-side timing, so latency is client-side wall-clock.
+    """
+    client = s3v_client()
+    kwargs = build_s3v_query(query_text, vector, k)
     t0 = time.perf_counter()
     try:
         resp = client.query_vectors(**kwargs)
@@ -319,6 +335,181 @@ def search_s3vectors(query_text, vector, k):
         "results": results,
         "mode": "hybrid (vector + BM25, server-side RRF)",
     }
+
+
+# ---------------------------------------------------------------------------
+# Load test (see bench.py)
+# ---------------------------------------------------------------------------
+SAMPLE_QUERIES = [
+    "why do leaves change color in autumn",
+    "how do vaccines train the immune system",
+    "the economic causes of the Great Depression",
+    "animals that can survive extreme cold",
+    "TCP three-way handshake SYN ACK",
+    "Apollo 13 oxygen tank explosion",
+    "CRISPR Cas9 gene editing",
+    "Treaty of Westphalia 1648",
+    "who painted the ceiling of the Sistine Chapel",
+    "difference between nuclear fission and fusion",
+]
+BENCH_LIMITS = {
+    "concurrency": (1, 64),
+    "duration_s": (5, 600),
+    "serial_rounds": (1, 10),
+    "queries": (1, 50),
+}
+S3V_THROTTLE_CODES = {"TooManyRequestsException", "ThrottlingException", "SlowDown",
+                      "ServiceUnavailableException"}
+
+_bench_lock = threading.Lock()
+_bench_current = None
+_embed_cache = {}
+
+
+def cached_embed(text):
+    if text not in _embed_cache:
+        _embed_cache[text] = embed(text)[0]
+    return _embed_cache[text]
+
+
+def opensearch_target(k, pipeline, bm25_weight, pool_size):
+    def new_worker():
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=pool_size)
+        session.mount("https://", adapter)
+        session.auth = HTTPBasicAuth(_cfg["os_user"], _cfg["os_pass"])
+        session.verify = False
+
+        def call(text, vector):
+            url, body, params, _ = build_os_search(text, vector, k, pipeline, bm25_weight)
+            try:
+                resp = session.post(url, json=body, params=params, timeout=60)
+            except requests.Timeout:
+                raise bench.CallError("timeout")
+            except requests.RequestException as e:
+                raise bench.CallError(type(e).__name__)
+            if resp.status_code >= 400:
+                raise bench.CallError(f"HTTP {resp.status_code}",
+                                      throttled=resp.status_code == 429)
+            return resp.json().get("took")
+        return call
+
+    return bench.Target("opensearch", "OpenSearch", new_worker)
+
+
+def s3vectors_target(k, pool_size):
+    # One client shared by all threads (boto3 clients are thread-safe). Retries
+    # are disabled so throttling shows up as errors instead of hidden latency.
+    client = boto3.client(
+        "s3vectors",
+        region_name=_cfg["s3v_region"],
+        config=Config(retries={"max_attempts": 1, "mode": "standard"},
+                      max_pool_connections=pool_size, read_timeout=60),
+    )
+
+    def new_worker():
+        def call(text, vector):
+            try:
+                client.query_vectors(**build_s3v_query(text, vector, k))
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "ClientError")
+                status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                raise bench.CallError(code, throttled=code in S3V_THROTTLE_CODES or status == 429)
+            except BotoCoreError as e:
+                raise bench.CallError(type(e).__name__)
+            return None
+        return call
+
+    return bench.Target("s3vectors", "S3 Vectors", new_worker)
+
+
+def _int_in(payload, name, default):
+    low, high = BENCH_LIMITS[name]
+    value = int(payload.get(name, default))
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be between {low} and {high}")
+    return value
+
+
+@app.route("/bench")
+def bench_page():
+    return render_template(
+        "bench.html",
+        pipelines=PIPELINES,
+        default_pipeline=_cfg.get("os_search_pipeline") or DEFAULT_PIPELINE,
+        sample_queries=SAMPLE_QUERIES,
+        limits=BENCH_LIMITS,
+    )
+
+
+@app.route("/api/bench/start", methods=["POST"])
+def bench_start():
+    global _bench_current
+    payload = request.get_json(force=True)
+    try:
+        concurrency = _int_in(payload, "concurrency", 4)
+        duration_s = _int_in(payload, "duration_s", 60)
+        serial_rounds = _int_in(payload, "serial_rounds", 3)
+        k = max(1, min(int(payload.get("k", 10)), 100))
+        queries = [q.strip() for q in payload.get("queries") or SAMPLE_QUERIES if q and q.strip()]
+        low, high = BENCH_LIMITS["queries"]
+        if not low <= len(queries) <= high:
+            raise ValueError(f"provide between {low} and {high} queries")
+        if any(len(q.encode("utf-8")) > 1000 for q in queries):
+            raise ValueError("each query must be at most 1000 bytes")
+        pipeline = payload.get("pipeline") or _cfg.get("os_search_pipeline") or DEFAULT_PIPELINE
+        if pipeline not in PIPELINES:
+            raise ValueError(f"unknown pipeline: {pipeline}")
+        bm25_weight = None
+        if pipeline == WEIGHTED_PIPELINE and payload.get("bm25_weight") is not None:
+            bm25_weight = round(float(payload["bm25_weight"]), 4)
+            if not 0.0 <= bm25_weight <= 1.0:
+                raise ValueError("bm25_weight must be between 0 and 1")
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    with _bench_lock:
+        if _bench_current and _bench_current.state == "running":
+            return jsonify({"error": "a load test is already running", "id": _bench_current.id}), 409
+        try:
+            vectors = [(q, cached_embed(q)) for q in queries]
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": f"embedding failed: {type(e).__name__}: {e}"}), 502
+        pool = concurrency + 2
+        settings = {
+            "concurrency": concurrency, "duration_s": duration_s,
+            "serial_rounds": serial_rounds, "k": k, "queries": len(queries),
+            "pipeline": pipeline, "bm25_weight": bm25_weight,
+            "warmup": bool(payload.get("warmup", True)),
+        }
+        _bench_current = bench.Benchmark(
+            targets=[opensearch_target(k, pipeline, bm25_weight, pool), s3vectors_target(k, pool)],
+            queries=vectors,
+            concurrency=concurrency,
+            duration_s=duration_s,
+            serial_rounds=serial_rounds,
+            warmup=settings["warmup"],
+            settings=settings,
+        )
+        _bench_current.start()
+        return jsonify({"id": _bench_current.id})
+
+
+@app.route("/api/bench/<run_id>")
+def bench_status(run_id):
+    run = _bench_current
+    if not run or run.id != run_id:
+        return jsonify({"error": "unknown run"}), 404
+    return jsonify(run.status())
+
+
+@app.route("/api/bench/<run_id>/stop", methods=["POST"])
+def bench_stop(run_id):
+    run = _bench_current
+    if not run or run.id != run_id:
+        return jsonify({"error": "unknown run"}), 404
+    run.stop()
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
