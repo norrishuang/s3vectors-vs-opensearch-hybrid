@@ -20,10 +20,66 @@ Both jobs are PySpark scripts run on **EMR Serverless**. The code is in
 
 ## 1. Dataset
 
-The jobs read Parquet files from an S3 prefix. The default is
-`s3://myemr-bucket-01/data/cohere-embedding-dataset/en/`; set `S3_INPUT` to
-use your own copy. The English subset has about 41.5 million rows, one per
-Wikipedia passage.
+The jobs load the English subset of
+[CohereLabs/wikipedia-2023-11-embed-multilingual-v3](https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3)
+on Hugging Face: Wikipedia (November 2023) split into passages, each with a
+precomputed Cohere embedding. The English subset is in the dataset's `en/`
+folder: 415 Parquet files, about 90 GB, 41,488,110 rows. The dataset is not
+gated, so no Hugging Face token is needed.
+
+### 1.1 Copy the dataset into your own S3 bucket
+
+The jobs read from an S3 prefix you own, which you pass as `S3_INPUT`. Copy
+the files once, preferably from an EC2 instance in the same region as the
+bucket.
+
+**Option A: copy one file at a time (needs under 1 GB of local disk).**
+
+```bash
+set -euo pipefail
+DEST=s3://<your-bucket>/cohere-wikipedia/en
+REPO=CohereLabs/wikipedia-2023-11-embed-multilingual-v3
+TMP="$(mktemp -d)"
+
+curl -sf "https://huggingface.co/api/datasets/$REPO/tree/main/en" \
+  | python3 -c 'import sys,json; [print(f["path"]) for f in json.load(sys.stdin) if f["path"].endswith(".parquet")]' \
+  > files.txt
+wc -l files.txt          # expect 415
+
+while read -r path; do
+  name="$(basename "$path")"
+  if aws s3 ls "$DEST/$name" >/dev/null 2>&1; then continue; fi   # already copied
+  curl -sfL --retry 5 -o "$TMP/$name" "https://huggingface.co/datasets/$REPO/resolve/main/$path"
+  aws s3 cp --only-show-errors "$TMP/$name" "$DEST/$name"
+  rm -f "$TMP/$name"
+done < files.txt
+```
+
+Each file is fully downloaded before it is uploaded, so a failed download
+never leaves a partial object in S3. If the loop stops, run it again; it skips
+files that are already in the bucket.
+
+**Option B: download with the Hugging Face CLI, then sync.** This needs about
+100 GB of free disk.
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download CohereLabs/wikipedia-2023-11-embed-multilingual-v3 \
+  --repo-type dataset --include "en/*" --local-dir ./cohere-wikipedia
+aws s3 sync ./cohere-wikipedia/en/ s3://<your-bucket>/cohere-wikipedia/en/
+```
+
+Check the copy:
+
+```bash
+aws s3 ls s3://<your-bucket>/cohere-wikipedia/en/ --summarize | tail -2   # Total Objects: 415
+```
+
+Then use `S3_INPUT=s3://<your-bucket>/cohere-wikipedia/en/` in the steps
+below. To load another language, copy that language's folder instead; the
+jobs only require the columns below with 1024-dimensional vectors.
+
+### 1.2 Schema
 
 | Column | Type | Used as |
 |---|---|---|
@@ -65,7 +121,7 @@ and replace `--packages` with `--jars` in the submit script.
 
 The EMR Serverless job role needs:
 
-- `s3:GetObject` and `s3:ListBucket` on the input prefix.
+- `s3:GetObject` and `s3:ListBucket` on your copy of the dataset (section 1.1).
 - `s3:GetObject` on the uploaded job script, and on the beta SDK archive for
   the S3 Vectors job.
 - `s3:PutObject` on the log prefix.
@@ -146,6 +202,7 @@ export LOG_URI=s3://<artifact-bucket>/logs/cohere-to-opensearch/
 export OPENSEARCH_ENDPOINT=https://<domain-endpoint>
 export OPENSEARCH_INDEX=cohere-wikipedia-en-cosine-v2
 export OPENSEARCH_SECRET_NAME=opensearch/cohere-ingest
+export S3_INPUT=s3://<your-bucket>/cohere-wikipedia/en/   # your copy from section 1.1
 
 bash ingestion/opensearch/submit_cohere_to_opensearch.sh
 ```
@@ -154,7 +211,6 @@ Optional variables and their defaults:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `S3_INPUT` | `s3://myemr-bucket-01/data/cohere-embedding-dataset/en/` | Parquet input prefix |
 | `OPENSEARCH_USERNAME` | `admin` | Basic-auth user |
 | `OPENSEARCH_TARGET` | `aos` | `aoss` for OpenSearch Serverless |
 | `OUTPUT_PARTITIONS` | `4` | Maximum concurrent writers (input partitions are coalesced down to this) |
@@ -266,6 +322,7 @@ export BETA_SDK_ARCHIVE_S3_URI=s3://<artifact-bucket>/artifacts/s3vectors-beta-s
 export LOG_URI=s3://<artifact-bucket>/logs/cohere-to-s3vectors/
 export VECTOR_BUCKET=<vector-bucket>
 export VECTOR_INDEX=cohere-wikipedia-en-hybrid-v1
+export S3_INPUT=s3://<your-bucket>/cohere-wikipedia/en/   # your copy from section 1.1
 export LIMIT=1000
 
 bash ingestion/s3vectors/submit_emr_serverless.sh
@@ -276,7 +333,6 @@ run the full load with `LIMIT=0`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `S3_INPUT` | `s3://myemr-bucket-01/data/cohere-embedding-dataset/en/` | Parquet input prefix |
 | `OUTPUT_PARTITIONS` | `4` | Maximum concurrent writers |
 | `BATCH_SIZE` | `500` | Vectors per `PutVectors` call (1 to 500) |
 | `MAX_RETRIES` | `12` | Retries on throttling and 5xx errors, with exponential backoff capped at 60 s |

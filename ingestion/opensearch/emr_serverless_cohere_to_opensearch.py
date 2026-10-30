@@ -26,8 +26,8 @@ def parse_args():
     )
     parser.add_argument(
         "--s3-input",
-        default="s3://myemr-bucket-01/data/cohere-embedding-dataset/en/",
-        help="Parquet input prefix.",
+        required=True,
+        help="Parquet input prefix, e.g. s3://<your-bucket>/cohere-wikipedia/en/.",
     )
     parser.add_argument(
         "--opensearch-endpoint",

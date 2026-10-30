@@ -10,7 +10,7 @@ set -euo pipefail
 : "${VECTOR_INDEX:?Set VECTOR_INDEX}"
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
-S3_INPUT="${S3_INPUT:-s3://myemr-bucket-01/data/cohere-embedding-dataset/en/}"
+: "${S3_INPUT:?Set S3_INPUT to your copy of the dataset, for example s3://<bucket>/cohere-wikipedia/en/}"
 OUTPUT_PARTITIONS="${OUTPUT_PARTITIONS:-4}"
 BATCH_SIZE="${BATCH_SIZE:-500}"
 MAX_RETRIES="${MAX_RETRIES:-12}"

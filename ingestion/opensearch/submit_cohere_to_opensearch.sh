@@ -11,7 +11,7 @@ set -euo pipefail
 : "${OPENSEARCH_SECRET_NAME:?Set OPENSEARCH_SECRET_NAME}"
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
-S3_INPUT="${S3_INPUT:-s3://myemr-bucket-01/data/cohere-embedding-dataset/en/}"
+: "${S3_INPUT:?Set S3_INPUT to your copy of the dataset, for example s3://<bucket>/cohere-wikipedia/en/}"
 OPENSEARCH_TARGET="${OPENSEARCH_TARGET:-aos}"
 OPENSEARCH_USERNAME="${OPENSEARCH_USERNAME:-admin}"
 OUTPUT_PARTITIONS="${OUTPUT_PARTITIONS:-4}"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 : "${BETA_SDK_ARCHIVE_S3_URI:=s3://s3vectors-beta-sdk/hybrid-pythonsdk.zip}"
 : "${BETA_SDK_ARCHIVE_LOCAL_PATH:=}"
-: "${OUTPUT_S3_URI:?Set OUTPUT_S3_URI, for example s3://myemr-bucket-01/artifacts/s3vectors-beta-sdk.zip}"
+: "${OUTPUT_S3_URI:?Set OUTPUT_S3_URI, for example s3://<bucket>/artifacts/s3vectors-beta-sdk.zip}"
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT

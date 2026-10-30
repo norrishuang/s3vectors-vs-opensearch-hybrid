@@ -155,8 +155,11 @@ curl -s http://127.0.0.1:8077/api/health
 ## Loading the data
 
 The `ingestion/` directory contains the EMR Serverless jobs that load the
-Cohere Wikipedia embedding dataset (about 41.5 million passages, 1024-dim
-vectors) from Parquet in S3 into both backends. Both jobs use the source `_id`
+English subset of the
+[CohereLabs/wikipedia-2023-11-embed-multilingual-v3](https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3)
+dataset (about 41.5 million passages, 1024-dim vectors) into both backends.
+Copy the dataset's Parquet files into your own S3 bucket first; the guide
+shows how. Both jobs use the source `_id`
 as the record key, so a re-run overwrites records instead of duplicating them.
 
 | Target | Code | What it does |
