@@ -53,6 +53,13 @@
   .results { padding: 6px 0; max-height: calc(100vh - 320px); overflow-y: auto; }
   .hit { padding: 12px 16px; border-bottom: 1px solid var(--border); }
   .hit:last-child { border-bottom: none; }
+  .hit.same { border-left: 4px solid var(--good); background: color-mix(in srgb, var(--good) 10%, var(--panel)); }
+  .hit.moved { border-left: 4px solid var(--accent2); background: color-mix(in srgb, var(--accent2) 10%, var(--panel)); }
+  .tag { display: inline-block; margin-left: 8px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .tag.same { color: #06210f; background: var(--good); }
+  .tag.moved { color: #2a1800; background: var(--accent2); }
+  .legend { padding: 0 24px 4px; color: var(--muted); font-size: 12px; display: flex; gap: 16px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
   .hit .rank { color: var(--muted); font-size: 11px; }
   .hit .title { font-weight: 600; margin: 2px 0; }
   .hit .title a { color: var(--accent); text-decoration: none; }
@@ -98,6 +105,12 @@
 </div>
 
 <div class="summary" id="summary"></div>
+<div class="legend">
+  <span><i style="background:var(--good)"></i>Same rank on both sides</span>
+  <span><i style="background:var(--accent2)"></i>In both result lists, different rank</span>
+  <span>Unmarked: only in this list</span>
+  <span id="overlap"></span>
+</div>
 
 <div class="cols">
   <div class="col os">
@@ -136,7 +149,16 @@ function searchPayload(q, k){
   return p;
 }
 
-function renderSide(prefix, data){
+function rankMap(data){
+  const m = new Map();
+  if(data && data.ok !== false && data.results){
+    data.results.forEach((h,i) => { if(h.id != null && !m.has(String(h.id))) m.set(String(h.id), i); });
+  }
+  return m;
+}
+
+function renderSide(prefix, data, other){
+  other = other || new Map();
   const badges = $(`#${prefix}-badges`);
   const meta = $(`#${prefix}-meta`);
   const results = $(`#${prefix}-results`);
@@ -168,8 +190,13 @@ function renderSide(prefix, data){
     if(h.bm25 != null) scores += `<span>bm25: ${(+h.bm25).toFixed(3)}</span>`;
     if(h.distance != null) scores += `<span>dist: ${(+h.distance).toFixed(5)}</span>`;
     if(h.id) scores += `<span>id: ${esc(String(h.id))}</span>`;
-    return `<div class="hit">
-      <div class="rank">#${i+1}</div>
+    const otherName = prefix === 'os' ? 'S3 Vectors' : 'OpenSearch';
+    const j = h.id != null ? other.get(String(h.id)) : undefined;
+    let cls = '', tag = '';
+    if(j === i){ cls = 'same'; tag = `<span class="tag same">same rank</span>`; }
+    else if(j !== undefined){ cls = 'moved'; tag = `<span class="tag moved">${otherName} #${j+1}</span>`; }
+    return `<div class="hit ${cls}">
+      <div class="rank">#${i+1}${tag}</div>
       <div class="title">${title}</div>
       <div class="snippet">${esc(h.text||'')}</div>
       <div class="scores">${scores}</div>
@@ -183,6 +210,7 @@ async function doSearch(){
   const k = parseInt($('#k').value,10) || 10;
   $('#go').disabled = true;
   $('#summary').innerHTML = `<span class="spinner"></span> Embedding query &amp; searching both sources…`;
+  $('#overlap').textContent = '';
   ['os','s3v'].forEach(p => {
     $(`#${p}-badges`).innerHTML = `<span class="badge"><span class="spinner"></span></span>`;
     $(`#${p}-results`).innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
@@ -202,8 +230,12 @@ async function doSearch(){
       renderSide('s3v', {ok:false, error:data.error});
       return;
     }
-    renderSide('os', data.opensearch);
-    renderSide('s3v', data.s3vectors);
+    const osMap = rankMap(data.opensearch), s3Map = rankMap(data.s3vectors);
+    renderSide('os', data.opensearch, s3Map);
+    renderSide('s3v', data.s3vectors, osMap);
+    let same = 0, both = 0;
+    osMap.forEach((i, id) => { if(s3Map.has(id)){ both++; if(s3Map.get(id) === i) same++; } });
+    $('#overlap').innerHTML = `Overlap: <b>${both}</b> in both · <b>${same}</b> same rank`;
     const osL = data.opensearch && (data.opensearch.took_ms ?? data.opensearch.wall_ms);
     const s3L = data.s3vectors && (data.s3vectors.wall_ms);
     let cmp = '';

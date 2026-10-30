@@ -40,6 +40,19 @@ their latency next to each other.
    with RRF. Each hit has `scores.fused`, `scores.bm25Scores` and
    `scores.vectorDistance`, and the UI shows all three.
 
+### Overlap marks
+
+Results are matched across the two lists by document ID (one Wikipedia passage
+per ID):
+
+- **Green**: the document is at the same rank in both lists.
+- **Orange**: the document is in both lists at different ranks. Its tag shows
+  the rank on the other side, for example `S3 Vectors #4`.
+- **Unmarked**: the document is only in this list.
+
+The line above the results shows how many documents are in both lists and how
+many share the same rank.
+
 ### Latency
 
 | Backend | What is shown |
