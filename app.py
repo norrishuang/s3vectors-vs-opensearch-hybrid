@@ -54,10 +54,30 @@ PIPELINES = {
         "label": "RRF (rank_constant=60)",
     },
     "nlp-search-pipeline": {
-        "label": "min_max + weighted mean (BM25 0.3 / kNN 0.7)",
+        "label": "min_max + weighted mean",
     },
 }
 DEFAULT_PIPELINE = "rrf-hybrid-pipeline"
+# For this pipeline the UI supplies the BM25/kNN weights; they are sent as a
+# temporary (request-body) pipeline so the stored pipeline is never modified.
+WEIGHTED_PIPELINE = "nlp-search-pipeline"
+
+
+def weighted_pipeline_body(bm25_weight):
+    """min_max + arithmetic_mean with weights [BM25, kNN] (hybrid query order)."""
+    return {
+        "phase_results_processors": [
+            {
+                "normalization-processor": {
+                    "normalization": {"technique": "min_max"},
+                    "combination": {
+                        "technique": "arithmetic_mean",
+                        "parameters": {"weights": [bm25_weight, round(1.0 - bm25_weight, 4)]},
+                    },
+                }
+            }
+        ]
+    }
 
 app = Flask(__name__)
 _cfg = {}
@@ -90,7 +110,7 @@ def embed(text):
 # ---------------------------------------------------------------------------
 # OpenSearch hybrid search (BM25 on text + knn on embedding, RRF-fused)
 # ---------------------------------------------------------------------------
-def search_opensearch(query_text, vector, k, pipeline=None):
+def search_opensearch(query_text, vector, k, pipeline=None, bm25_weight=None):
     """
     Hybrid query combining BM25 full-text and kNN vector search, fused by the
     given search pipeline (RRF or min_max weighted). Falls back to a bool
@@ -124,8 +144,14 @@ def search_opensearch(query_text, vector, k, pipeline=None):
         },
     }
     params = {}
-    if pipeline:
-        params["search_pipeline"] = pipeline
+    if pipeline == WEIGHTED_PIPELINE and bm25_weight is not None:
+        body["search_pipeline"] = weighted_pipeline_body(bm25_weight)
+        mode_label = (f"min_max + weighted mean (BM25 {bm25_weight:g} / "
+                      f"kNN {round(1.0 - bm25_weight, 4):g}, per-request)")
+    else:
+        if pipeline:
+            params["search_pipeline"] = pipeline
+        mode_label = PIPELINES.get(pipeline, {}).get("label", pipeline or "no pipeline")
 
     t0 = time.perf_counter()
     resp = requests.post(
@@ -164,7 +190,7 @@ def search_opensearch(query_text, vector, k, pipeline=None):
         "latency_source": "server (took)",
         "count": len(results),
         "results": results,
-        "mode": f"hybrid (BM25 + kNN) · {PIPELINES.get(pipeline, {}).get('label', pipeline or 'no pipeline')}",
+        "mode": f"hybrid (BM25 + kNN) · {mode_label}",
         "pipeline": pipeline,
     }
 
@@ -319,8 +345,16 @@ def api_search():
     pipeline = payload.get("pipeline") or _cfg.get("os_search_pipeline") or DEFAULT_PIPELINE
     if pipeline not in PIPELINES:
         return jsonify({"error": f"unknown pipeline: {pipeline}"}), 400
+    bm25_weight = None
+    if pipeline == WEIGHTED_PIPELINE and payload.get("bm25_weight") is not None:
+        try:
+            bm25_weight = round(float(payload["bm25_weight"]), 4)
+        except (TypeError, ValueError):
+            return jsonify({"error": "bm25_weight must be a number"}), 400
+        if not 0.0 <= bm25_weight <= 1.0:
+            return jsonify({"error": "bm25_weight must be between 0 and 1"}), 400
 
-    out = {"query": query_text, "k": k, "pipeline": pipeline}
+    out = {"query": query_text, "k": k, "pipeline": pipeline, "bm25_weight": bm25_weight}
 
     # 1. Embed once, share with both backends.
     try:
@@ -331,7 +365,7 @@ def api_search():
 
     # 2. Query both sources.
     try:
-        out["opensearch"] = search_opensearch(query_text, vector, k, pipeline)
+        out["opensearch"] = search_opensearch(query_text, vector, k, pipeline, bm25_weight)
     except Exception as e:  # noqa: BLE001
         out["opensearch"] = {"ok": False, "error": f"{type(e).__name__}: {e}",
                              "trace": traceback.format_exc()[-500:]}

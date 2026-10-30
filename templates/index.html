@@ -25,6 +25,11 @@
     border: 1px solid var(--border); border-radius: 8px; color: var(--text); }
   .searchbar select { padding: 11px 10px; background: var(--panel2); color: var(--text);
     border: 1px solid var(--border); border-radius: 8px; font-size: 13px; }
+  .weights { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; }
+  .weights[hidden] { display: none; }
+  .weights input[type=range] { width: 110px; accent-color: var(--accent); }
+  #wlabel { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text); min-width: 84px; text-align: center; }
   .searchbar button { padding: 11px 22px; font-size: 15px; font-weight: 600; cursor: pointer;
     background: var(--accent); color: #06101f; border: none; border-radius: 8px; }
   .searchbar button:disabled { opacity: .5; cursor: default; }
@@ -83,6 +88,12 @@
     <option value="{{ name }}" {% if name == default_pipeline %}selected{% endif %}>{{ p.label }}</option>
     {% endfor %}
   </select>
+  <span id="weights" class="weights" hidden>
+    <label for="bm25w">BM25</label>
+    <input type="range" id="bm25w" min="0" max="1" step="0.05" value="0.5">
+    <span id="wlabel">0.50 / 0.50</span>
+    <label>kNN</label>
+  </span>
   <button id="go">Search</button>
 </div>
 
@@ -111,6 +122,19 @@
 const $ = s => document.querySelector(s);
 
 function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+const WEIGHTED_PIPELINE = 'nlp-search-pipeline';
+function isWeighted(){ return $('#pipeline').value === WEIGHTED_PIPELINE; }
+function syncWeights(){ $('#weights').hidden = !isWeighted(); }
+function updateWeightLabel(){
+  const b = parseFloat($('#bm25w').value);
+  $('#wlabel').textContent = `${b.toFixed(2)} / ${(1-b).toFixed(2)}`;
+}
+function searchPayload(q, k){
+  const p = {q, k, pipeline: $('#pipeline').value};
+  if(isWeighted()) p.bm25_weight = parseFloat($('#bm25w').value);
+  return p;
+}
 
 function renderSide(prefix, data){
   const badges = $(`#${prefix}-badges`);
@@ -168,7 +192,7 @@ async function doSearch(){
     const t0 = performance.now();
     const r = await fetch('/api/search', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({q, k, pipeline: $('#pipeline').value})
+      body: JSON.stringify(searchPayload(q, k))
     });
     const data = await r.json();
     const total = (performance.now()-t0).toFixed(0);
@@ -200,7 +224,11 @@ async function doSearch(){
 
 $('#go').addEventListener('click', doSearch);
 $('#q').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
-$('#pipeline').addEventListener('change', () => { if($('#q').value.trim()) doSearch(); });
+$('#pipeline').addEventListener('change', () => { syncWeights(); if($('#q').value.trim()) doSearch(); });
+$('#bm25w').addEventListener('input', updateWeightLabel);
+$('#bm25w').addEventListener('change', () => { if($('#q').value.trim()) doSearch(); });
+syncWeights();
+updateWeightLabel();
 </script>
 </body>
 </html>
