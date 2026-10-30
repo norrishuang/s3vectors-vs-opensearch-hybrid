@@ -152,6 +152,22 @@ curl -s -XPOST http://127.0.0.1:8077/api/search -H 'Content-Type: application/js
 curl -s http://127.0.0.1:8077/api/health
 ```
 
+## Loading the data
+
+The `ingestion/` directory contains the EMR Serverless jobs that load the
+Cohere Wikipedia embedding dataset (about 41.5 million passages, 1024-dim
+vectors) from Parquet in S3 into both backends. Both jobs use the source `_id`
+as the record key, so a re-run overwrites records instead of duplicating them.
+
+| Target | Code | What it does |
+|---|---|---|
+| OpenSearch | `ingestion/opensearch/` | `create_cohere_vector_index.py` creates a disk-mode k-NN index (cosine, 32x compression) with BM25 `title`/`text` fields. `emr_serverless_cohere_to_opensearch.py` writes the documents with the OpenSearch Spark connector, using basic auth with the password read from Secrets Manager. |
+| S3 Vectors | `ingestion/s3vectors/` | `create_hybrid_index.py` creates a cosine index with `passage_body` as the searchable text field. `ingest_cohere_to_s3vectors.py` writes the vectors with `PutVectors` in batches of up to 500, retrying throttled requests. `package_beta_sdk.sh` packages the beta SDK for Spark, and `query_hybrid_index.py` runs a test query. |
+
+Step-by-step instructions, including IAM permissions, job parameters and
+troubleshooting, are in
+[docs/ingestion-emr-serverless.md](docs/ingestion-emr-serverless.md).
+
 ## Sample queries
 
 The demo dataset is English Wikipedia. These queries are grouped by which half
@@ -200,6 +216,9 @@ templates/index.html         Single-page UI
 opensearch/*.json            Search pipeline definitions
 run.sh / restart.sh          Start scripts (load .env)
 .env.example                 Configuration template
+ingestion/opensearch/        EMR Serverless job: Cohere Parquet -> OpenSearch
+ingestion/s3vectors/         EMR Serverless job: Cohere Parquet -> S3 Vectors
+docs/                        Ingestion guide
 ```
 
 ## License
